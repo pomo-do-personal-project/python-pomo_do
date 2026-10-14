@@ -218,3 +218,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI / ML Model weights (auto-downloaded on first run)
+*.pt
+*.task
+*.onnx
+*.bin
+
+# Agents & AI configuration
+.agents/
+.agent/
+skills-lock.json
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
