@@ -235,3 +235,8 @@ skills-lock.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Ignore all markdown files except README.md
+*.md
+!README.md
+!readme.md
