@@ -18,8 +18,9 @@ class FocusDetector:
         self.screen_manager = ScreenManager(config_filename)
         self.vision = VisionPipeline(current_dir)
 
-        self.tolerance_x = 0.22
-        self.tolerance_y = 0.18
+        # Chế độ Thoải mái mặc định: góc nhìn rộng, bộ đệm 2.0s chống báo sai
+        self.tolerance_x = 0.28
+        self.tolerance_y = 0.24
         self.eye_closed_threshold = 0.013
         self.eye_closed_start_time = None
 
@@ -27,6 +28,17 @@ class FocusDetector:
         self.last_look_y = 0.0
         self.has_face = False
         self.history = deque(maxlen=8)
+
+        # Bộ đệm nhịp khung hình để tối ưu CPU (chạy YOLO mỗi 3 frames)
+        self.frame_count = 0
+        self.last_has_phone = False
+        self.last_phone_boxes = []
+        self.last_suspicious_hand = False
+        self.last_suspicious_roi = None
+        self.sensitivity = "relaxed"
+        self.phone_confirm_delay = 2.0
+        self.baseline_calibrated = False
+        self.baseline_info = None
 
         print("[pomo-ai] Khởi tạo FocusDetector thành công!")
 
@@ -39,6 +51,28 @@ class FocusDetector:
 
     def reset_screens(self):
         return self.screen_manager.reset_screens()
+
+    def set_sensitivity(self, level="standard"):
+        """Điều chỉnh độ nhạy AI: relaxed | standard | strict."""
+        self.sensitivity = level
+        if level == "relaxed":
+            self.tolerance_x, self.tolerance_y, self.phone_confirm_delay = 0.28, 0.24, 2.0
+        elif level == "strict":
+            self.tolerance_x, self.tolerance_y, self.phone_confirm_delay = 0.16, 0.14, 1.0
+        else:
+            self.tolerance_x, self.tolerance_y, self.phone_confirm_delay = 0.22, 0.18, 1.5
+        print(f"[pomo-ai] Cập nhật độ nhạy: {self.sensitivity} (delay={self.phone_confirm_delay}s)")
+        return {"sensitivity": self.sensitivity, "delay": self.phone_confirm_delay}
+
+    def calibrate_baseline(self):
+        """Lưu dáng ngồi chuẩn và nhận diện mắt kính."""
+        if not self.has_face:
+            return {"success": False, "message": "Không thấy khuôn mặt"}
+        self.baseline_calibrated = True
+        self.baseline_info = {"look_x": self.last_look_x, "look_y": self.last_look_y}
+        if len(self.screens) == 0:
+            self.add_screen(self.last_look_x, self.last_look_y)
+        return {"success": True, "baseline": self.baseline_info}
 
     def check_focus(self, frame):
         """Nhận diện trạng thái tập trung từ 1 khung hình camera."""
@@ -96,8 +130,25 @@ class FocusDetector:
                 self.eye_closed_start_time = None
                 raw_status = "AFK"
 
-        # 3. Quét nhận diện điện thoại
-        has_phone, phone_boxes = self.vision.detect_phone(frame, face_box, look_x)
+        # 3. Quét nhận diện điện thoại 2 tầng (chạy mỗi 3 khung hình để video mượt mà 30 FPS)
+        self.frame_count += 1
+        if self.frame_count % 3 == 0:
+            self.last_suspicious_hand, self.last_suspicious_roi = self.vision.check_suspicious_hand_near_ear(frame, face_box)
+            self.last_has_phone, self.last_phone_boxes = self.vision.detect_phone(frame, face_box, look_x, self.last_suspicious_roi)
+
+        raw_has_phone = self.last_has_phone
+        phone_boxes = self.last_phone_boxes
+        is_suspicious_hand = self.last_suspicious_hand
+
+        # Nguyên lý 1: Bộ đệm xác nhận thời gian (chỉ kích hoạt khi giữ điện thoại >= delay liên tục)
+        now = time.time()
+        if raw_has_phone:
+            if not hasattr(self, "phone_start_time") or self.phone_start_time is None:
+                self.phone_start_time = now
+            has_phone = (now - self.phone_start_time) >= self.phone_confirm_delay
+        else:
+            self.phone_start_time = None
+            has_phone = False
 
         # 4. Phân loại trạng thái
         detail = ""
@@ -109,7 +160,7 @@ class FocusDetector:
                 detail = "Nhắm mắt ngủ gật (>2.5s)"
             elif has_phone:
                 raw_status = "DISTRACTED"
-                detail = "Phát hiện dùng điện thoại"
+                detail = "Phát hiện nghe điện thoại" if is_suspicious_hand else "Phát hiện dùng điện thoại"
             else:
                 matched_id = self.screen_manager.match_screen(look_x, look_y, self.tolerance_x, self.tolerance_y)
                 if matched_id is not None:
@@ -132,6 +183,11 @@ class FocusDetector:
         elif not detail:
             detail = "Mất tập trung"
 
+        hands = getattr(self.vision, "last_hands", [])
+        if not has_phone:
+            for h in hands:
+                h["holding_phone"] = False
+
         return {
             "status": smoothed,
             "detail": detail,
@@ -142,8 +198,13 @@ class FocusDetector:
             "look_y": look_y,
             "has_face": self.has_face,
             "has_phone": has_phone,
+            "is_suspicious_hand": is_suspicious_hand,
+            "sensitivity": self.sensitivity,
+            "baseline_calibrated": self.baseline_calibrated,
             "points": points,
             "mesh_points": mesh_points,
             "face_box": face_box,
-            "phone_boxes": phone_boxes
+            "phone_boxes": phone_boxes,
+            "hands": hands
         }
+

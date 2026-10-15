@@ -1,13 +1,6 @@
 """
-server.py - FastAPI WebSocket Server cho pomo-ai
-Dành cho dự án: pomo-ai (Pomo-do)
-Mục tiêu: Cung cấp WebSocket endpoint để giao diện web pomo-do kết nối,
-nhận dữ liệu sự tập trung thời gian thực và điều khiển cấu hình màn hình.
-
-Endpoints:
-  - GET  /         : Kiểm tra trạng thái server (Health check).
-  - GET  /screens  : Lấy danh sách các màn hình hiện tại.
-  - WS   /ws       : WebSocket kết nối trực tiếp với web app pomo-do.
+server.py - FastAPI WebSocket Server cho pomo-ai (Pomo-do)
+Quản lý luồng webcam, nhận diện sự tập trung và điều khiển hiệu chuẩn màn hình.
 """
 
 import asyncio
@@ -16,17 +9,12 @@ import base64
 import cv2
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 import uvicorn
 
 from detector import FocusDetector
+from hud_drawer import draw_hud
 
-# Khởi tạo ứng dụng FastAPI
-app = FastAPI(
-    title="Pomo-AI Focus Tracking Service",
-    description="WebSocket & API Service nhận diện tập trung và hiệu chuẩn nhiều màn hình cho Pomo-do",
-    version="1.0.0"
-)
+app = FastAPI(title="Pomo-AI Focus Service", version="1.0.0")
 
 # Cho phép Cross-Origin để Frontend (Next.js / React) kết nối thoải mái
 app.add_middleware(
@@ -43,20 +31,55 @@ detector = FocusDetector()
 
 @app.get("/")
 def health_check():
-    """Kiểm tra hoạt động của service."""
-    return {
-        "status": "online",
-        "service": "pomo-ai",
-        "screens_count": len(detector.screens)
-    }
+    return {"status": "online", "service": "pomo-ai", "screens_count": len(detector.screens)}
 
 
 @app.get("/screens")
 def get_screens():
-    """Lấy danh sách các màn hình đã lưu trong config.json."""
+    return {"total_screens": len(detector.screens), "screens": detector.screens}
+
+
+@app.post("/analyze_session")
+async def analyze_session(data: dict):
+    """Phân tích dữ liệu quan sát của phiên học và đưa ra kết luận thông minh."""
+    total = max(1, int(data.get("total_seconds", 0)))
+    focused = int(data.get("focused_seconds", 0))
+    phone_cnt = int(data.get("phone_count", 0))
+    sleep_cnt = int(data.get("sleep_count", 0))
+    look_cnt = int(data.get("look_away_count", 0))
+    task_name = data.get("task_name") or "Tự do"
+
+    score = min(100, max(0, round((focused / total) * 100)))
+    grade = "S" if score >= 95 else "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D"
+
+    insights = []
+    if score >= 85:
+        insights.append(f"Xuất sắc! Bạn duy trì độ tập trung {score}% trong phiên '{task_name}'.")
+    elif score >= 65:
+        insights.append(f"Khá tốt ({score}%), bạn đã hoàn thành phần lớn thời gian học.")
+    else:
+        insights.append(f"Phiên này bị xao nhãng nhiều ({score}% tập trung).")
+
+    if phone_cnt > 0:
+        insights.append(f"Có {phone_cnt} lần dùng điện thoại.")
+    if sleep_cnt > 0:
+        insights.append(f"Có {sleep_cnt} lần ngủ gật.")
+    if look_cnt > 0:
+        insights.append(f"Có {look_cnt} lần nhìn ra ngoài.")
+
+    conclusion = " ".join(insights)
+    advice = "Để điện thoại xa tầm tay ở phiên kế tiếp." if phone_cnt > 0 else "Nên rửa mặt hoặc vươn vai nếu thấy buồn ngủ." if sleep_cnt > 0 else "Tiếp tục duy trì phong độ tập trung này!"
+
     return {
-        "total_screens": len(detector.screens),
-        "screens": detector.screens
+        "score": score,
+        "grade": grade,
+        "conclusion": conclusion,
+        "advice": advice,
+        "phone_count": phone_cnt,
+        "sleep_count": sleep_cnt,
+        "look_away_count": look_cnt,
+        "focused_seconds": focused,
+        "total_seconds": total
     }
 
 
@@ -75,7 +98,8 @@ class CameraManager:
             "look_x": None,
             "look_y": None,
             "has_face": False,
-            "phone_boxes": []
+            "phone_boxes": [],
+            "hands": []
         }
 
     async def add_client(self, websocket: WebSocket):
@@ -112,63 +136,12 @@ class CameraManager:
                 frame = cv2.flip(frame, 1)
                 self.latest_result = detector.check_focus(frame)
 
-                # Vẽ HUD và FaceMesh theo phong cách ảnh 2 của người dùng
-                preview = frame.copy()
-                h_f, w_f = preview.shape[:2]
+                # 1. Vẽ HUD và FaceMesh theo module hud_drawer
+                preview = draw_hud(frame.copy(), self.latest_result)
 
-                has_face = self.latest_result.get("has_face", False)
-                has_phone = self.latest_result.get("has_phone", False)
-                is_focused = self.latest_result.get("is_focused", False)
-                active_screen = self.latest_result.get("active_screen")
-                face_box = self.latest_result.get("face_box")
-                mesh_points = self.latest_result.get("mesh_points", [])
-                phone_boxes = self.latest_result.get("phone_boxes", [])
-
-                # 1. Vẽ các điểm mốc FaceMesh chấm trắng li ti trên khuôn mặt (chuẩn ảnh 2)
-                for pt in mesh_points:
-                    cv2.circle(preview, pt, 1, (245, 245, 245), -1)
-
-                # 2. Vẽ khung bao khuôn mặt (Face Bounding Box: Xanh khi tập trung, Đỏ khi mất tập trung)
-                if face_box:
-                    fx1, fy1, fx2, fy2 = face_box
-                    box_color = (0, 255, 0) if is_focused else (0, 0, 255)
-                    cv2.rectangle(preview, (fx1, fy1), (fx2, fy2), box_color, 2)
-
-                    # Text góc trên khung: "Status: Focused" hoặc "Status: Distracted"
-                    status_text = "Status: Focused" if is_focused else f"Status: {self.latest_result.get('detail', 'Distracted')}"
-                    cv2.putText(preview, status_text, (fx1, max(fy1 - 8, 22)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2, cv2.LINE_AA)
-
-                    # Text góc dưới khung: "Gaze: forward" hoặc "Gaze: Screen X"
-                    if is_focused:
-                        gaze_text = f"Gaze: Screen {active_screen}" if active_screen else "Gaze: forward"
-                    else:
-                        gaze_text = "Gaze: away"
-                    cv2.putText(preview, gaze_text, (fx1, min(fy2 + 20, h_f - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
-                # 3. Vẽ chữ HUD góc trên bên trái (chuẩn ảnh 2):
-                # Dòng 1: "No phone" (xanh lá) hoặc "Phone: YES" (đỏ)
-                phone_str = "Phone: YES" if has_phone else "No phone"
-                phone_col = (0, 0, 255) if has_phone else (0, 255, 0)
-                cv2.putText(preview, phone_str, (15, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, phone_col, 2, cv2.LINE_AA)
-
-                # Dòng 2: "Face: YES" (xanh lá) hoặc "Face: NO" (đỏ)
-                face_str = "Face: YES" if has_face else "Face: NO"
-                face_col = (0, 255, 0) if has_face else (0, 0, 255)
-                cv2.putText(preview, face_str, (15, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.65, face_col, 2, cv2.LINE_AA)
-
-                # 4. Chỉ vẽ khung đỏ khi phát hiện điện thoại thật sự (đã qua lọc ghế và kính)
-                for p in phone_boxes:
-                    x1, y1, x2, y2 = p["box"]
-                    conf = p["conf"]
-                    cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(preview, f"PHONE {int(conf*100)}%", (x1 + 4, max(y1 - 6, 18)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
-
-                # Nén ảnh JPEG sắc nét (480x360) dạng Base64 gửi cho màn hình hiển thị trên web
+                # 2. Nén ảnh JPEG sắc nét tối ưu (480x360, chất lượng 60) dạng Base64
                 thumb = cv2.resize(preview, (480, 360))
-                _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 60])
                 image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
 
                 # Broadcast kết quả đến tất cả client đang kết nối
@@ -186,7 +159,8 @@ class CameraManager:
                 for ws in disconnected:
                     self.clients.discard(ws)
 
-            await asyncio.sleep(0.3)
+            # Nghỉ 15ms để đạt tốc độ mượt mà 25-30 FPS, không nghẽn CPU
+            await asyncio.sleep(0.015)
 
         if self.cap is not None:
             self.cap.release()
@@ -220,62 +194,36 @@ async def websocket_endpoint(websocket: WebSocket):
 
             if action == "add_screen":
                 new_screen = detector.add_screen()
-                await websocket.send_json({
-                    "event": "screen_added",
-                    "success": new_screen is not None,
-                    "screen": new_screen,
-                    "total_screens": len(detector.screens)
-                })
-
+                await websocket.send_json({"event": "screen_added", "success": new_screen is not None, "total_screens": len(detector.screens)})
             elif action == "reset":
                 detector.reset_screens()
-                await websocket.send_json({
-                    "event": "screens_reset",
-                    "total_screens": 0
-                })
-
+                await websocket.send_json({"event": "screens_reset", "total_screens": 0})
             elif action == "get_screens":
-                await websocket.send_json({
-                    "event": "screens_list",
-                    "screens": detector.screens,
-                    "total_screens": len(detector.screens)
-                })
-
+                await websocket.send_json({"event": "screens_list", "screens": detector.screens, "total_screens": len(detector.screens)})
             elif action == "get_status":
-                await websocket.send_json({
-                    "event": "focus_update",
-                    **camera_manager.latest_result
-                })
-
+                await websocket.send_json({"event": "focus_update", **camera_manager.latest_result})
+            elif action == "set_sensitivity":
+                level = payload.get("level", "relaxed")
+                res = detector.set_sensitivity(level)
+                await websocket.send_json({"event": "sensitivity_updated", **res})
             elif action == "stop_camera":
                 async with camera_manager.lock:
                     camera_manager.is_running = False
                     if camera_manager.cap is not None:
                         camera_manager.cap.release()
                         camera_manager.cap = None
-                print("[pomo-ai server] Da tat phan cung webcam theo yeu cau tu web.")
                 await websocket.send_json({"event": "camera_stopped"})
-
             elif action == "start_camera":
                 async with camera_manager.lock:
                     if not camera_manager.is_running:
                         camera_manager.is_running = True
                         asyncio.create_task(camera_manager._capture_loop())
-                print("[pomo-ai server] Da bat lai phan cung webcam theo yeu cau tu web.")
                 await websocket.send_json({"event": "camera_started"})
-
-    except WebSocketDisconnect:
-        print("[pomo-ai server] Client web pomo-do da ngat ket noi.")
-    except Exception as e:
-        print(f"[pomo-ai server] Loi ket noi client: {e}")
+    except (WebSocketDisconnect, Exception) as e:
+        print(f"[pomo-ai server] Client ngat ket noi: {e}")
     finally:
         await camera_manager.remove_client(websocket)
 
-
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  POMO-AI FASTAPI WEBSOCKET SERVER DANG KHOI CHAY")
-    print("  Dia chi WebSocket: ws://localhost:8001/ws")
-    print("  Dia chi API doc:    http://localhost:8001/docs")
-    print("=" * 60)
+    print("POMO-AI Server running on ws://localhost:8001/ws")
     uvicorn.run(app, host="0.0.0.0", port=8001)
