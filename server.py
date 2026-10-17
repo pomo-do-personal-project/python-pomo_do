@@ -134,7 +134,7 @@ class CameraManager:
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.flip(frame, 1)
-                self.latest_result = detector.check_focus(frame)
+                self.latest_result = await asyncio.to_thread(detector.check_focus, frame)
 
                 # 1. Vẽ HUD và FaceMesh theo module hud_drawer
                 preview = draw_hud(frame.copy(), self.latest_result)
