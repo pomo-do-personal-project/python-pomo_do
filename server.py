@@ -170,12 +170,12 @@ async def process_client_frame(websocket: WebSocket, image_data: str):
         # Chạy suy luận nhận diện tập trung qua detector
         result = await asyncio.to_thread(detector.check_focus, frame)
 
-        # Vẽ HUD và FaceMesh trực quan với độ phân giải sắc nét
+        # Vẽ HUD và FaceMesh trực quan (Tối ưu 440px và chất lượng 65 để độ trễ siêu thấp)
         preview = draw_hud(frame.copy(), result)
         h_f, w_f = preview.shape[:2]
-        if w_f > 640:
-            preview = cv2.resize(preview, (640, int(h_f * 640 / w_f)))
-        _, buf = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if w_f > 440:
+            preview = cv2.resize(preview, (440, int(h_f * 440 / w_f)))
+        _, buf = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 65])
         image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
 
         # Dọn dẹp biến để giải phóng RAM ngay lập tức

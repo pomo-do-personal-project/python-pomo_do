@@ -18,8 +18,8 @@ def draw_hud(preview, latest_result):
     phone_boxes = latest_result.get("phone_boxes", [])
     hands = latest_result.get("hands", [])
 
-    # 1. Vẽ các điểm mốc FaceMesh chấm trắng li ti trên khuôn mặt
-    for pt in mesh_points:
+    # 1. Vẽ các điểm mốc FaceMesh chấm trắng li ti trên khuôn mặt (vẽ cách điểm để tối ưu CPU)
+    for pt in mesh_points[::2]:
         cv2.circle(preview, pt, 1, (245, 245, 245), -1)
 
     # 2. Vẽ khung bao khuôn mặt (Xanh khi tập trung, Đỏ khi mất tập trung)
