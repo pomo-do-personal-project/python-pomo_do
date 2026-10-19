@@ -2,6 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Tối ưu RAM cho môi trường đám mây giới hạn (Render Free 512MB)
+ENV MALLOC_TRIM_THRESHOLD_=100000
+ENV PYTHONUNBUFFERED=1
+ENV OMP_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
+
 # Cài đặt các thư viện hệ thống cần thiết cho MediaPipe và OpenCV trên Linux
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \

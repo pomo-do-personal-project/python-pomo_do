@@ -7,6 +7,12 @@ import cv2
 import mediapipe as mp
 
 try:
+    import torch
+    torch.set_num_threads(1)
+except Exception:
+    torch = None
+
+try:
     from ultralytics import YOLO
 except Exception as e:
     YOLO = None
@@ -24,9 +30,10 @@ class VisionPipeline:
         self.last_wrists, self.last_hands = [], []
         if YOLO is not None:
             try:
+                # Nạp duy nhất YOLOv8n nhận diện điện thoại (tiết kiệm ~120MB RAM cho Render 512MB)
                 self.yolo = YOLO("yolov8n.pt")
-                self.pose = YOLO("yolov8n-pose.pt")
-                print("[pomo-ai] Nạp YOLOv8n và YOLOv8n-pose thành công!")
+                self.pose = None
+                print("[pomo-ai] Nạp YOLOv8n thành công (Tối ưu RAM Render < 350MB)!")
             except Exception as e:
                 print(f"[pomo-ai] Cảnh báo nạp YOLO: {e}")
 

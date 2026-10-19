@@ -7,6 +7,7 @@ import asyncio
 import json
 import base64
 import cv2
+import gc
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,9 +85,13 @@ async def analyze_session(data: dict):
     }
 
 
+frame_counter = 0
+
 async def process_client_frame(websocket: WebSocket, image_data: str):
     """Xử lý từng khung hình do trình duyệt của người dùng gửi lên qua WebSocket."""
+    global frame_counter
     try:
+        frame_counter += 1
         if "," in image_data:
             image_data = image_data.split(",", 1)[1]
 
@@ -104,9 +109,16 @@ async def process_client_frame(websocket: WebSocket, image_data: str):
 
         # Vẽ HUD và FaceMesh trực quan
         preview = draw_hud(frame.copy(), result)
-        thumb = cv2.resize(preview, (480, 360))
-        _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 55])
+        thumb = cv2.resize(preview, (320, 240))
+        _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 50])
         image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
+
+        # Dọn dẹp biến để giải phóng RAM ngay lập tức
+        del img_bytes, np_arr, frame, preview, thumb, buf
+
+        # Thu hồi rác định kỳ mỗi 15 frame để giữ RAM < 350MB trên Render Free
+        if frame_counter % 15 == 0:
+            gc.collect()
 
         # Trả kết quả kèm ảnh preview đã vẽ khung cho chính client này
         await websocket.send_json({
