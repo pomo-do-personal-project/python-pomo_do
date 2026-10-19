@@ -7,6 +7,7 @@ import asyncio
 import json
 import base64
 import cv2
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -83,104 +84,50 @@ async def analyze_session(data: dict):
     }
 
 
-class CameraManager:
-    """Quản lý Webcam dùng chung để nhiều tab trình duyệt kết nối đồng thời không bị lỗi xung đột camera."""
-    def __init__(self):
-        self.cap = None
-        self.clients = set()
-        self.is_running = False
-        self.lock = asyncio.Lock()
-        self.latest_result = {
-            "status": "AFK",
-            "is_focused": False,
-            "active_screen": None,
-            "total_screens": 0,
-            "look_x": None,
-            "look_y": None,
-            "has_face": False,
-            "phone_boxes": [],
-            "hands": []
-        }
+async def process_client_frame(websocket: WebSocket, image_data: str):
+    """Xử lý từng khung hình do trình duyệt của người dùng gửi lên qua WebSocket."""
+    try:
+        if "," in image_data:
+            image_data = image_data.split(",", 1)[1]
 
-    async def add_client(self, websocket: WebSocket):
-        async with self.lock:
-            self.clients.add(websocket)
-            if not self.is_running:
-                self.is_running = True
-                asyncio.create_task(self._capture_loop())
-
-    async def remove_client(self, websocket: WebSocket):
-        async with self.lock:
-            self.clients.discard(websocket)
-            if len(self.clients) == 0 and self.is_running:
-                self.is_running = False
-                if self.cap is not None:
-                    self.cap.release()
-                    self.cap = None
-                print("[pomo-ai server] Tat ca client da ngat, da giai phong webcam.")
-
-    async def _capture_loop(self):
-        print("[pomo-ai server] Dang khoi dong Webcam cho cac client...")
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened():
-            print("[pomo-ai server] Khong the mo webcam!")
-            self.is_running = False
+        img_bytes = base64.b64decode(image_data)
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if frame is None:
             return
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Lật ảnh ngang (mirror) để người dùng nhìn tự nhiên như gương
+        frame = cv2.flip(frame, 1)
 
-        while self.is_running and len(self.clients) > 0:
-            ret, frame = self.cap.read()
-            if ret:
-                frame = cv2.flip(frame, 1)
-                self.latest_result = await asyncio.to_thread(detector.check_focus, frame)
+        # Chạy suy luận nhận diện tập trung qua detector
+        result = await asyncio.to_thread(detector.check_focus, frame)
 
-                # 1. Vẽ HUD và FaceMesh theo module hud_drawer
-                preview = draw_hud(frame.copy(), self.latest_result)
+        # Vẽ HUD và FaceMesh trực quan
+        preview = draw_hud(frame.copy(), result)
+        thumb = cv2.resize(preview, (480, 360))
+        _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 55])
+        image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
 
-                # 2. Nén ảnh JPEG sắc nét tối ưu (480x360, chất lượng 60) dạng Base64
-                thumb = cv2.resize(preview, (480, 360))
-                _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 60])
-                image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
-
-                # Broadcast kết quả đến tất cả client đang kết nối
-                disconnected = []
-                for ws in list(self.clients):
-                    try:
-                        await ws.send_json({
-                            "event": "focus_update",
-                            "image": image_base64,
-                            **self.latest_result
-                        })
-                    except Exception:
-                        disconnected.append(ws)
-
-                for ws in disconnected:
-                    self.clients.discard(ws)
-
-            # Nghỉ 15ms để đạt tốc độ mượt mà 25-30 FPS, không nghẽn CPU
-            await asyncio.sleep(0.015)
-
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
-        self.is_running = False
-
-
-camera_manager = CameraManager()
+        # Trả kết quả kèm ảnh preview đã vẽ khung cho chính client này
+        await websocket.send_json({
+            "event": "focus_update",
+            "image": image_base64,
+            **result
+        })
+    except Exception as e:
+        print(f"[pomo-ai server] Lỗi xử lý frame từ client: {e}")
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint /ws phục vụ giao tiếp 2 chiều với web pomo-do:
-    - Server gửi: kết quả nhận diện (status, is_focused, look_x, look_y, active_screen...) mỗi 0.3 giây.
-    - Web gửi lên: lệnh điều khiển (action: 'add_screen', 'reset', 'get_screens').
+    - Client gửi: khung hình webcam (action: 'frame', image: 'data:image/jpeg;base64,...')
+                  và các lệnh điều khiển ('add_screen', 'reset', 'get_screens', 'set_sensitivity').
+    - Server gửi: kết quả nhận diện (status, is_focused, look_x, look_y, active_screen, image...).
     """
     await websocket.accept()
-    print("[pomo-ai server] Client web pomo-do da ket noi vao WebSocket /ws")
-    await camera_manager.add_client(websocket)
+    print("[pomo-ai server] Client web pomo-do đã kết nối vào WebSocket /ws")
 
     try:
         while True:
@@ -192,7 +139,11 @@ async def websocket_endpoint(websocket: WebSocket):
 
             action = payload.get("action")
 
-            if action == "add_screen":
+            if action == "frame":
+                img = payload.get("image")
+                if img:
+                    await process_client_frame(websocket, img)
+            elif action == "add_screen":
                 new_screen = detector.add_screen()
                 await websocket.send_json({"event": "screen_added", "success": new_screen is not None, "total_screens": len(detector.screens)})
             elif action == "reset":
@@ -200,29 +151,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"event": "screens_reset", "total_screens": 0})
             elif action == "get_screens":
                 await websocket.send_json({"event": "screens_list", "screens": detector.screens, "total_screens": len(detector.screens)})
-            elif action == "get_status":
-                await websocket.send_json({"event": "focus_update", **camera_manager.latest_result})
             elif action == "set_sensitivity":
                 level = payload.get("level", "relaxed")
                 res = detector.set_sensitivity(level)
                 await websocket.send_json({"event": "sensitivity_updated", **res})
-            elif action == "stop_camera":
-                async with camera_manager.lock:
-                    camera_manager.is_running = False
-                    if camera_manager.cap is not None:
-                        camera_manager.cap.release()
-                        camera_manager.cap = None
-                await websocket.send_json({"event": "camera_stopped"})
-            elif action == "start_camera":
-                async with camera_manager.lock:
-                    if not camera_manager.is_running:
-                        camera_manager.is_running = True
-                        asyncio.create_task(camera_manager._capture_loop())
-                await websocket.send_json({"event": "camera_started"})
     except (WebSocketDisconnect, Exception) as e:
-        print(f"[pomo-ai server] Client ngat ket noi: {e}")
-    finally:
-        await camera_manager.remove_client(websocket)
+        print(f"[pomo-ai server] Client ngắt kết nối: {e}")
 
 if __name__ == "__main__":
     print("POMO-AI Server running on ws://localhost:8001/ws")
