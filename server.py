@@ -3,8 +3,17 @@ server.py - FastAPI WebSocket Server cho pomo-ai (Pomo-do)
 Quản lý luồng webcam, nhận diện sự tập trung và điều khiển hiệu chuẩn màn hình.
 """
 
+import os
+import sys
 import asyncio
 import json
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import base64
 import cv2
 import gc
@@ -36,9 +45,63 @@ def health_check():
     return {"status": "online", "service": "pomo-ai", "screens_count": len(detector.screens)}
 
 
+def get_current_ram_mb() -> float:
+    """Lấy số MB RAM thực tế (RSS) đang sử dụng (hoạt động chuẩn trên cả Windows CMD và Linux/Render)."""
+    try:
+        import psutil
+        return round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
+    except Exception:
+        try:
+            if os.path.exists("/proc/self/status"):
+                with open("/proc/self/status", "r") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            return round(int(line.split()[1]) / 1024, 2)
+        except Exception:
+            pass
+    return 0.0
+
+
 @app.get("/screens")
 def get_screens():
     return {"total_screens": len(detector.screens), "screens": detector.screens}
+
+
+@app.get("/memory")
+def get_memory_stats():
+    """Đo lường RAM thực tế tiến trình Python đang sử dụng (MB)."""
+    ram_mb = get_current_ram_mb()
+    percent = round((ram_mb / 512.0) * 100, 1)
+    return {
+        "current_ram_mb": ram_mb,
+        "render_free_limit_mb": 512.0,
+        "usage_percentage": f"{percent}%",
+        "status": "HEALTHY" if percent <= 85.0 else "WARNING",
+        "message": "RAM an toàn trong hạn mức 512MB" if percent <= 85.0 else "RAM cao"
+    }
+
+
+async def ram_monitor_loop():
+    """Vòng lặp chạy ngầm in RAM sử dụng trực tiếp ra màn hình CMD mỗi 10 giây."""
+    while True:
+        await asyncio.sleep(10)
+        ram = get_current_ram_mb()
+        percent = round((ram / 512.0) * 100, 1)
+        status = "AN TOÀN" if percent <= 80 else "CẢNH BÁO CAO"
+        print(f"📊 [pomo-ai RAM] Đang dùng: {ram:.1f} MB / 512 MB ({percent}%) | Đã nhận: {frame_counter} frames | Trạng thái: {status}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    ram = get_current_ram_mb()
+    percent = round((ram / 512.0) * 100, 1)
+    print("\n" + "=" * 60)
+    print(f"🚀 POMO-AI SERVER ĐÃ SẴN SÀNG!")
+    print(f"📊 RAM lúc nạp Model: {ram:.1f} MB / 512 MB ({percent}%)")
+    print(f"🌐 WebSocket: ws://localhost:8001/ws")
+    print(f"🔗 Xem API RAM: http://localhost:8001/memory")
+    print("=" * 60 + "\n")
+    asyncio.create_task(ram_monitor_loop())
 
 
 @app.post("/analyze_session")
@@ -107,18 +170,31 @@ async def process_client_frame(websocket: WebSocket, image_data: str):
         # Chạy suy luận nhận diện tập trung qua detector
         result = await asyncio.to_thread(detector.check_focus, frame)
 
-        # Vẽ HUD và FaceMesh trực quan
+        # Vẽ HUD và FaceMesh trực quan với độ phân giải sắc nét
         preview = draw_hud(frame.copy(), result)
-        thumb = cv2.resize(preview, (320, 240))
-        _, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 50])
+        h_f, w_f = preview.shape[:2]
+        if w_f > 640:
+            preview = cv2.resize(preview, (640, int(h_f * 640 / w_f)))
+        _, buf = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 75])
         image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
 
         # Dọn dẹp biến để giải phóng RAM ngay lập tức
-        del img_bytes, np_arr, frame, preview, thumb, buf
+        del img_bytes, np_arr, frame, preview, buf
 
-        # Thu hồi rác định kỳ mỗi 15 frame để giữ RAM < 350MB trên Render Free
+        # Thu hồi rác định kỳ mỗi 15 frame để giữ RAM siêu nhẹ
         if frame_counter % 15 == 0:
             gc.collect()
+            try:
+                import ctypes
+                if os.name == "nt":
+                    ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1)
+                else:
+                    ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+            ram_mb = get_current_ram_mb()
+            percent = round((ram_mb / 512.0) * 100, 1)
+            print(f"📸 [pomo-ai Frame #{frame_counter}] RAM: {ram_mb:.1f} MB ({percent}%) | Thu hồi rác GC xong")
 
         # Trả kết quả kèm ảnh preview đã vẽ khung cho chính client này
         await websocket.send_json({
@@ -171,5 +247,10 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"[pomo-ai server] Client ngắt kết nối: {e}")
 
 if __name__ == "__main__":
-    print("POMO-AI Server running on ws://localhost:8001/ws")
+    init_ram = get_current_ram_mb()
+    percent = round((init_ram / 512.0) * 100, 1)
+    print("=" * 60)
+    print("🚀 POMO-AI Server running on ws://localhost:8001/ws")
+    print(f"📊 RAM lúc nạp Model: {init_ram:.1f} MB / 512 MB ({percent}%)")
+    print("=" * 60)
     uvicorn.run(app, host="0.0.0.0", port=8001)

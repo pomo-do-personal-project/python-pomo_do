@@ -29,6 +29,13 @@ class FocusDetector:
         self.has_face = False
         self.history = deque(maxlen=8)
 
+        # Bộ đệm Face Persistence chống chớp tắt Face: NO khi chạm tay vào đầu/trán/mặt
+        self.last_face_time = 0.0
+        self.last_valid_look_x = 0.0
+        self.last_valid_look_y = 0.0
+        self.last_valid_face_box = None
+        self.last_valid_points = None
+
         # Bộ đệm nhịp khung hình để tối ưu CPU (chạy YOLO mỗi 3 frames)
         self.frame_count = 0
         self.last_has_phone = False
@@ -81,12 +88,14 @@ class FocusDetector:
         look_x, look_y = None, None
         h, w = frame.shape[:2]
 
+        now = time.time()
         # 1. Trích xuất MediaPipe landmarks
         landmarks = self.vision.extract_landmarks(frame)
         points, mesh_points, face_box = None, [], None
 
         if landmarks is not None:
             self.has_face = True
+            self.last_face_time = now
             mesh_points = [(int(p.x * w), int(p.y * h)) for p in landmarks]
             xs, ys = [pt[0] for pt in mesh_points], [pt[1] for pt in mesh_points]
             pad_x = int((max(xs) - min(xs)) * 0.1)
@@ -104,7 +113,6 @@ class FocusDetector:
 
             # Kiểm tra nhắm mắt / ngủ gật
             if abs(upper_lid.y - lower_lid.y) < self.eye_closed_threshold:
-                now = time.time()
                 if self.eye_closed_start_time is None:
                     self.eye_closed_start_time = now
                 elif (now - self.eye_closed_start_time) >= 2.5:
@@ -116,15 +124,25 @@ class FocusDetector:
             eye_cy = (left_eye.y + right_eye.y) / 2.0
             look_x = round(nose.x - eye_cx, 3)
             look_y = round(nose.y - eye_cy, 3)
+
+            # Lưu lại trạng thái khuôn mặt hợp lệ gần nhất
+            self.last_valid_look_x = look_x
+            self.last_valid_look_y = look_y
+            self.last_valid_face_box = face_box
+            self.last_valid_points = points
         else:
-            # 2. Fallback sang YOLOv8 Pose khi quay mặt góc lớn
-            pose_ok, p_lx, p_ly, p_pts, p_box = self.vision.estimate_pose_look(frame, w, h)
-            if pose_ok:
+            # 2. Xử lý khi MediaPipe FaceMesh bị che khuất tạm thời (chạm tay lên đầu/trán, chỉnh kính, gãi mặt)
+            has_person, head_box = self.vision.detect_person_and_head(frame)
+            time_since_face = now - self.last_face_time
+
+            # Nếu YOLO xác nhận người vẫn đang ngồi trước bàn hoặc vừa thấy mặt trong 2.0s
+            if has_person or (time_since_face < 2.0 and self.last_valid_face_box is not None):
                 self.has_face = True
                 self.eye_closed_start_time = None
-                look_x, look_y, points = p_lx, p_ly, p_pts
-                if face_box is None:
-                    face_box = p_box
+                look_x = self.last_valid_look_x
+                look_y = self.last_valid_look_y
+                face_box = head_box if head_box is not None else self.last_valid_face_box
+                points = self.last_valid_points
             else:
                 self.has_face = False
                 self.eye_closed_start_time = None

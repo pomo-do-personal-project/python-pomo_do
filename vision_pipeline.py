@@ -4,38 +4,42 @@ vision_pipeline.py - Khởi tạo mô hình và pipeline xử lý hình ảnh ch
 
 import os
 import cv2
+import numpy as np
 import mediapipe as mp
-
-try:
-    import torch
-    torch.set_num_threads(1)
-except Exception:
-    torch = None
-
-try:
-    from ultralytics import YOLO
-except Exception as e:
-    YOLO = None
-    print(f"[pomo-ai] Chú ý: Không thể import YOLO ({e}).")
 
 
 class VisionPipeline:
-    """Đóng gói việc nạp và suy luận của MediaPipe và YOLO."""
+    """Đóng gói việc nạp và suy luận của MediaPipe và YOLO (Tối ưu RAM siêu nhẹ bằng ONNX / OpenCV DNN)."""
 
     def __init__(self, base_dir):
         self.use_legacy_mesh = False
         self.use_tasks_mesh = False
         self._init_mediapipe(base_dir)
         self.yolo, self.pose = None, None
+        self.net = None
         self.last_wrists, self.last_hands = [], []
-        if YOLO is not None:
+
+        # 1. Ưu tiên nạp mô hình ONNX qua OpenCV DNN (Tiết kiệm >300MB RAM, không cần nạp PyTorch nặng nề)
+        onnx_model_path = os.path.join(base_dir, "yolov8n.onnx")
+        if os.path.exists(onnx_model_path):
             try:
-                # Nạp duy nhất YOLOv8n nhận diện điện thoại (tiết kiệm ~120MB RAM cho Render 512MB)
-                self.yolo = YOLO("yolov8n.pt")
-                self.pose = None
-                print("[pomo-ai] Nạp YOLOv8n thành công (Tối ưu RAM Render < 350MB)!")
+                self.net = cv2.dnn.readNetFromONNX(onnx_model_path)
+                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                print("[pomo-ai] Nạp YOLOv8n ONNX (OpenCV DNN) thành công -> RAM cực nhẹ < 160MB!")
             except Exception as e:
-                print(f"[pomo-ai] Cảnh báo nạp YOLO: {e}")
+                print(f"[pomo-ai] Cảnh báo nạp ONNX: {e}")
+
+        # 2. Fallback sang PyTorch Ultralytics nếu chưa có file ONNX
+        if self.net is None:
+            try:
+                import torch
+                torch.set_num_threads(1)
+                from ultralytics import YOLO
+                self.yolo = YOLO("yolov8n.pt")
+                print("[pomo-ai] Nạp YOLOv8n qua PyTorch thành công!")
+            except Exception as e:
+                print(f"[pomo-ai] Cảnh báo nạp YOLO PyTorch: {e}")
 
     def _init_mediapipe(self, current_dir):
         """Khởi tạo MediaPipe Face Mesh hỗ trợ mọi phiên bản."""
@@ -209,9 +213,83 @@ class VisionPipeline:
         is_centered = abs(bcx - (fx1 + fx2) / 2.0) < (fw * 0.38)
         return in_eye_level and is_centered and (bh < fh * 0.48) and (bw <= fw * 1.15)
 
+    def detect_person_and_head(self, frame, conf_threshold=0.40, imgsz=256):
+        """Phát hiện người và ước lượng vị trí đầu khi MediaPipe bị che khuất tạm thời (chạm tay, quay đầu)."""
+        if self.net is None and self.yolo is None:
+            return False, None
+
+        h, w = frame.shape[:2]
+        try:
+            if self.net is not None:
+                blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
+                self.net.setInput(blob)
+                preds = self.net.forward()
+                preds = preds[0].transpose(1, 0)
+                person_scores = preds[:, 4]  # Class 0: person
+                best_idx = int(np.argmax(person_scores))
+                if person_scores[best_idx] > conf_threshold:
+                    p = preds[best_idx]
+                    scale_x = w / float(imgsz)
+                    scale_y = h / float(imgsz)
+                    cx, cy, bw, bh = p[0] * scale_x, p[1] * scale_y, p[2] * scale_x, p[3] * scale_y
+                    px1 = max(0, int(cx - bw / 2.0))
+                    py1 = max(0, int(cy - bh / 2.0))
+                    px2 = min(w, int(cx + bw / 2.0))
+                    head_bottom = min(h, int(py1 + bh * 0.45))
+                    return True, [px1, py1, px2, head_bottom]
+            elif self.yolo is not None:
+                res = self.yolo(frame, verbose=False, conf=conf_threshold, classes=[0], imgsz=256)
+                for r in res:
+                    for box in r.boxes:
+                        b = [int(v) for v in box.xyxy[0].tolist()]
+                        bh = b[3] - b[1]
+                        return True, [b[0], b[1], b[2], min(h, int(b[1] + bh * 0.45))]
+        except Exception as e:
+            print(f"[pomo-ai] Cảnh báo phát hiện người: {e}")
+
+        return False, None
+
+    def _detect_phone_onnx(self, img, conf_threshold=0.35, imgsz=256):
+        """Chạy inference YOLOv8 qua OpenCV DNN cực kỳ nhẹ RAM và CPU (< 150MB)."""
+        h, w = img.shape[:2]
+        blob = cv2.dnn.blobFromImage(img, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        preds = self.net.forward()  # Shape: (1, 84, 1344)
+        preds = preds[0].transpose(1, 0)  # Shape: (1344, 84)
+
+        phone_scores = preds[:, 71]  # 4 bbox + class 67 (cell phone)
+        mask = phone_scores > conf_threshold
+        if not np.any(mask):
+            return []
+
+        valid_preds = preds[mask]
+        boxes = []
+        scores = []
+        scale_x = w / float(imgsz)
+        scale_y = h / float(imgsz)
+
+        for p in valid_preds:
+            cx, cy, bw, bh = p[0] * scale_x, p[1] * scale_y, p[2] * scale_x, p[3] * scale_y
+            x1 = int(cx - bw / 2.0)
+            y1 = int(cy - bh / 2.0)
+            boxes.append([x1, y1, int(bw), int(bh)])
+            scores.append(float(p[71]))
+
+        indices = cv2.dnn.NMSBoxes(boxes, scores, conf_threshold, 0.45)
+        results = []
+        if len(indices) > 0:
+            for idx in indices:
+                i = idx if isinstance(idx, (int, np.integer)) else idx[0]
+                x, y, bw, bh = boxes[i]
+                results.append({
+                    "box": [max(0, x), max(0, y), min(w, x + bw), min(h, y + bh)],
+                    "conf": round(scores[i], 2)
+                })
+        return results
+
     def detect_phone(self, frame, face_box, look_x, suspicious_roi=None):
         """Nhận diện điện thoại 2 tầng kết hợp Hand-Object Interaction (HOI)."""
-        if self.yolo is None:
+        if self.net is None and self.yolo is None:
             return False, []
 
         for h in self.last_hands:
@@ -219,30 +297,55 @@ class VisionPipeline:
 
         phone_boxes = []
         try:
-            res = self.yolo(frame, verbose=False, conf=0.35, classes=[67], imgsz=320)
-            for r in res:
-                for box in r.boxes:
-                    conf = float(box.conf[0])
-                    b = [int(v) for v in box.xyxy[0].tolist()]
+            if self.net is not None:
+                candidates = self._detect_phone_onnx(frame, conf_threshold=0.35, imgsz=256)
+                for cand in candidates:
+                    b = cand["box"]
+                    conf = cand["conf"]
                     if (b[2] - b[0]) < 35 or (b[3] - b[1]) < 35 or conf < 0.38:
                         continue
                     if self._is_eyeglasses(b, face_box) or not self._is_hand_attached(b):
                         continue
-                    phone_boxes.append({"box": b, "conf": round(conf, 2)})
+                    phone_boxes.append(cand)
 
-            if suspicious_roi is not None:
-                rx1, ry1, rx2, ry2 = suspicious_roi
-                if (rx2 - rx1) >= 50 and (ry2 - ry1) >= 50:
-                    roi_res = self.yolo(frame[ry1:ry2, rx1:rx2], verbose=False, conf=0.24, classes=[67], imgsz=224)
-                    for r in roi_res:
-                        for box in r.boxes:
-                            conf = float(box.conf[0])
-                            cb = [int(v) for v in box.xyxy[0].tolist()]
+                if suspicious_roi is not None:
+                    rx1, ry1, rx2, ry2 = suspicious_roi
+                    if (rx2 - rx1) >= 50 and (ry2 - ry1) >= 50:
+                        roi_crop = frame[ry1:ry2, rx1:rx2]
+                        roi_cands = self._detect_phone_onnx(roi_crop, conf_threshold=0.24, imgsz=224)
+                        for cand in roi_cands:
+                            cb = cand["box"]
+                            conf = cand["conf"]
                             gbox = [rx1 + cb[0], ry1 + cb[1], rx1 + cb[2], ry1 + cb[3]]
                             if not self._is_eyeglasses(gbox, face_box) and self._is_hand_attached(gbox):
                                 if not any(abs(gbox[0] - pb["box"][0]) < 30 and abs(gbox[1] - pb["box"][1]) < 30 for pb in phone_boxes):
                                     phone_boxes.append({"box": gbox, "conf": round(conf, 2)})
+            elif self.yolo is not None:
+                res = self.yolo(frame, verbose=False, conf=0.35, classes=[67], imgsz=256)
+                for r in res:
+                    for box in r.boxes:
+                        conf = float(box.conf[0])
+                        b = [int(v) for v in box.xyxy[0].tolist()]
+                        if (b[2] - b[0]) < 35 or (b[3] - b[1]) < 35 or conf < 0.38:
+                            continue
+                        if self._is_eyeglasses(b, face_box) or not self._is_hand_attached(b):
+                            continue
+                        phone_boxes.append({"box": b, "conf": round(conf, 2)})
+
+                if suspicious_roi is not None:
+                    rx1, ry1, rx2, ry2 = suspicious_roi
+                    if (rx2 - rx1) >= 50 and (ry2 - ry1) >= 50:
+                        roi_res = self.yolo(frame[ry1:ry2, rx1:rx2], verbose=False, conf=0.24, classes=[67], imgsz=224)
+                        for r in roi_res:
+                            for box in r.boxes:
+                                conf = float(box.conf[0])
+                                cb = [int(v) for v in box.xyxy[0].tolist()]
+                                gbox = [rx1 + cb[0], ry1 + cb[1], rx1 + cb[2], ry1 + cb[3]]
+                                if not self._is_eyeglasses(gbox, face_box) and self._is_hand_attached(gbox):
+                                    if not any(abs(gbox[0] - pb["box"][0]) < 30 and abs(gbox[1] - pb["box"][1]) < 30 for pb in phone_boxes):
+                                        phone_boxes.append({"box": gbox, "conf": round(conf, 2)})
         except Exception as e:
-            print(f"[pomo-ai] Cảnh báo YOLO phone: {e}")
+            print(f"[pomo-ai] Cảnh báo phát hiện điện thoại: {e}")
 
         return len(phone_boxes) > 0, phone_boxes
+

@@ -223,6 +223,7 @@ __marimo__/
 *.pt
 *.task
 *.onnx
+!yolov8n.onnx
 *.bin
 
 # Agents & AI configuration

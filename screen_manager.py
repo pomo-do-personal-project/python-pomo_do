@@ -3,8 +3,16 @@ screen_manager.py - Quản lý cấu hình màn hình hiệu chuẩn cho pomo-ai
 """
 
 import os
+import sys
 import json
 import math
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 
 class ScreenManager:
