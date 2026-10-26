@@ -4,13 +4,39 @@ routes_theme.py - API router trích xuất theme màu bằng AI
 
 import os
 import base64
+import ipaddress
+import socket
 import urllib.request
+from urllib.parse import urlparse
 from typing import Optional
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
 from theme_color_extractor import extract_theme_from_image_bytes
 
 router = APIRouter(tags=["Theme"])
+
+
+def is_safe_external_url(url: str) -> bool:
+    """Kiểm tra ngăn chặn tấn công SSRF: chặn truy cập vào private IP, loopback và metadata cloud."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        if hostname.lower() in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            return False
+
+        addr_infos = socket.getaddrinfo(hostname, None)
+        for addr in addr_infos:
+            ip_str = addr[4][0]
+            ip = ipaddress.ip_address(ip_str)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 class AnalyzeThemeRequest(BaseModel):
@@ -65,11 +91,23 @@ async def analyze_theme_endpoint(request: Request):
                     with open(local_path, "rb") as f:
                         return extract_theme_from_image_bytes(f.read())
 
-            headers = {"User-Agent": "Mozilla/5.0"}
+            # Chặn triệt để tấn công SSRF vào mạng nội bộ hoặc IP Private
+            if not is_safe_external_url(url):
+                raise HTTPException(
+                    status_code=400,
+                    detail="URL ảnh không hợp lệ hoặc trỏ đến dải địa chỉ nội bộ bị cấm (SSRF Protection)."
+                )
+
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as response:
-                contents = response.read()
+                # Giới hạn kích thước ảnh tải về tối đa 15MB
+                contents = response.read(15 * 1024 * 1024 + 1)
+                if len(contents) > 15 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail="Kích thước ảnh vượt quá giới hạn 15MB cho phép.")
                 return extract_theme_from_image_bytes(contents)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Không thể tải ảnh từ URL: {str(e)}")
 
