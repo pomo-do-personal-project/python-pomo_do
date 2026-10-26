@@ -69,10 +69,12 @@ def draw_hud(preview, latest_result):
             cv2.putText(preview, f"TAY ({hand_id[0]})", (max(10, hx - 26), max(hy - int(r * 0.65) - 6, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 230, 0), 1, cv2.LINE_AA)
 
-    # 5. Vẽ khung bao đỏ quanh điện thoại
+    # 5. Vẽ khung bao đỏ quanh điện thoại (chỉ vẽ khi đã xác nhận hoặc độ tin cậy vượt trội)
     for p in phone_boxes:
-        x1, y1, x2, y2 = p["box"]
         conf = p["conf"]
+        if not has_phone and conf < 0.60:
+            continue
+        x1, y1, x2, y2 = p["box"]
         cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 0, 255), 2)
         cv2.putText(preview, f"PHONE {int(conf*100)}%", (x1 + 4, max(y1 - 6, 18)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)

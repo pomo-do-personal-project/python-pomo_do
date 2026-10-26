@@ -7,13 +7,6 @@ import os
 import sys
 import asyncio
 import json
-
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 import base64
 import cv2
 import gc
@@ -22,12 +15,20 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from detector import FocusDetector
 from hud_drawer import draw_hud
+from routes_theme import router as theme_router
+from routes_session import router as session_router, get_current_ram_mb
 
 app = FastAPI(title="Pomo-AI Focus Service", version="1.0.0")
 
-# Cho phép Cross-Origin để Frontend (Next.js / React) kết nối thoải mái
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,49 +37,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Khởi tạo bộ nhận diện FocusDetector dùng chung
+# Gắn các route chức năng độc lập
+app.include_router(theme_router)
+app.include_router(session_router)
+
 detector = FocusDetector()
+frame_counter = 0
 
 
 @app.get("/")
+@app.get("/ai")
+@app.get("/ai/")
 def health_check():
     return {"status": "online", "service": "pomo-ai", "screens_count": len(detector.screens)}
 
 
-def get_current_ram_mb() -> float:
-    """Lấy số MB RAM thực tế (RSS) đang sử dụng (hoạt động chuẩn trên cả Windows CMD và Linux/Render)."""
-    try:
-        import psutil
-        return round(psutil.Process().memory_info().rss / (1024 * 1024), 2)
-    except Exception:
-        try:
-            if os.path.exists("/proc/self/status"):
-                with open("/proc/self/status", "r") as f:
-                    for line in f:
-                        if line.startswith("VmRSS:"):
-                            return round(int(line.split()[1]) / 1024, 2)
-        except Exception:
-            pass
-    return 0.0
-
-
 @app.get("/screens")
+@app.get("/ai/screens")
 def get_screens():
     return {"total_screens": len(detector.screens), "screens": detector.screens}
-
-
-@app.get("/memory")
-def get_memory_stats():
-    """Đo lường RAM thực tế tiến trình Python đang sử dụng (MB)."""
-    ram_mb = get_current_ram_mb()
-    percent = round((ram_mb / 512.0) * 100, 1)
-    return {
-        "current_ram_mb": ram_mb,
-        "render_free_limit_mb": 512.0,
-        "usage_percentage": f"{percent}%",
-        "status": "HEALTHY" if percent <= 85.0 else "WARNING",
-        "message": "RAM an toàn trong hạn mức 512MB" if percent <= 85.0 else "RAM cao"
-    }
 
 
 async def ram_monitor_loop():
@@ -103,52 +80,6 @@ async def startup_event():
     print("=" * 60 + "\n")
     asyncio.create_task(ram_monitor_loop())
 
-
-@app.post("/analyze_session")
-async def analyze_session(data: dict):
-    """Phân tích dữ liệu quan sát của phiên học và đưa ra kết luận thông minh."""
-    total = max(1, int(data.get("total_seconds", 0)))
-    focused = int(data.get("focused_seconds", 0))
-    phone_cnt = int(data.get("phone_count", 0))
-    sleep_cnt = int(data.get("sleep_count", 0))
-    look_cnt = int(data.get("look_away_count", 0))
-    task_name = data.get("task_name") or "Tự do"
-
-    score = min(100, max(0, round((focused / total) * 100)))
-    grade = "S" if score >= 95 else "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 50 else "D"
-
-    insights = []
-    if score >= 85:
-        insights.append(f"Xuất sắc! Bạn duy trì độ tập trung {score}% trong phiên '{task_name}'.")
-    elif score >= 65:
-        insights.append(f"Khá tốt ({score}%), bạn đã hoàn thành phần lớn thời gian học.")
-    else:
-        insights.append(f"Phiên này bị xao nhãng nhiều ({score}% tập trung).")
-
-    if phone_cnt > 0:
-        insights.append(f"Có {phone_cnt} lần dùng điện thoại.")
-    if sleep_cnt > 0:
-        insights.append(f"Có {sleep_cnt} lần ngủ gật.")
-    if look_cnt > 0:
-        insights.append(f"Có {look_cnt} lần nhìn ra ngoài.")
-
-    conclusion = " ".join(insights)
-    advice = "Để điện thoại xa tầm tay ở phiên kế tiếp." if phone_cnt > 0 else "Nên rửa mặt hoặc vươn vai nếu thấy buồn ngủ." if sleep_cnt > 0 else "Tiếp tục duy trì phong độ tập trung này!"
-
-    return {
-        "score": score,
-        "grade": grade,
-        "conclusion": conclusion,
-        "advice": advice,
-        "phone_count": phone_cnt,
-        "sleep_count": sleep_cnt,
-        "look_away_count": look_cnt,
-        "focused_seconds": focused,
-        "total_seconds": total
-    }
-
-
-frame_counter = 0
 
 async def process_client_frame(websocket: WebSocket, image_data: str):
     """Xử lý từng khung hình do trình duyệt của người dùng gửi lên qua WebSocket."""
@@ -178,7 +109,6 @@ async def process_client_frame(websocket: WebSocket, image_data: str):
         _, buf = cv2.imencode('.jpg', preview, [cv2.IMWRITE_JPEG_QUALITY, 65])
         image_base64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode('utf-8')
 
-        # Dọn dẹp biến để giải phóng RAM ngay lập tức
         del img_bytes, np_arr, frame, preview, buf
 
         # Thu hồi rác định kỳ mỗi 15 frame để giữ RAM siêu nhẹ
@@ -207,12 +137,12 @@ async def process_client_frame(websocket: WebSocket, image_data: str):
 
 
 @app.websocket("/ws")
+@app.websocket("/ai/ws")
 async def websocket_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint /ws phục vụ giao tiếp 2 chiều với web pomo-do:
-    - Client gửi: khung hình webcam (action: 'frame', image: 'data:image/jpeg;base64,...')
-                  và các lệnh điều khiển ('add_screen', 'reset', 'get_screens', 'set_sensitivity').
-    - Server gửi: kết quả nhận diện (status, is_focused, look_x, look_y, active_screen, image...).
+    - Client gửi: khung hình webcam và lệnh điều khiển
+    - Server gửi: kết quả nhận diện (status, is_focused, active_screen, image...).
     """
     await websocket.accept()
     print("[pomo-ai server] Client web pomo-do đã kết nối vào WebSocket /ws")
@@ -245,6 +175,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"event": "sensitivity_updated", **res})
     except (WebSocketDisconnect, Exception) as e:
         print(f"[pomo-ai server] Client ngắt kết nối: {e}")
+
 
 if __name__ == "__main__":
     init_ram = get_current_ram_mb()

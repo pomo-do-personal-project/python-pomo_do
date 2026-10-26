@@ -18,34 +18,26 @@ class FocusDetector:
         self.screen_manager = ScreenManager(config_filename)
         self.vision = VisionPipeline(current_dir)
 
-        # Chế độ Thoải mái mặc định: góc nhìn rộng, bộ đệm 2.0s chống báo sai
-        self.tolerance_x = 0.28
-        self.tolerance_y = 0.24
+        # Chế độ Thoải mái mặc định & bộ đệm
+        self.tolerance_x, self.tolerance_y = 0.28, 0.24
         self.eye_closed_threshold = 0.013
         self.eye_closed_start_time = None
-
-        self.last_look_x = 0.0
-        self.last_look_y = 0.0
+        self.last_look_x, self.last_look_y = 0.0, 0.0
         self.has_face = False
         self.history = deque(maxlen=8)
 
-        # Bộ đệm Face Persistence chống chớp tắt Face: NO khi chạm tay vào đầu/trán/mặt
+        # Bộ đệm Face Persistence chống chớp tắt Face khi chạm tay
         self.last_face_time = 0.0
-        self.last_valid_look_x = 0.0
-        self.last_valid_look_y = 0.0
-        self.last_valid_face_box = None
-        self.last_valid_points = None
+        self.last_valid_look_x, self.last_valid_look_y = 0.0, 0.0
+        self.last_valid_face_box, self.last_valid_points = None, None
 
-        # Bộ đệm nhịp khung hình để tối ưu CPU (chạy YOLO mỗi 3 frames)
+        # Bộ đệm nhịp khung hình để tối ưu CPU
         self.frame_count = 0
         self.last_has_phone = False
         self.last_phone_boxes = []
-        self.last_suspicious_hand = False
-        self.last_suspicious_roi = None
-        self.sensitivity = "relaxed"
-        self.phone_confirm_delay = 2.0
-        self.baseline_calibrated = False
-        self.baseline_info = None
+        self.last_suspicious_hand, self.last_suspicious_roi = False, None
+        self.sensitivity, self.phone_confirm_delay = "relaxed", 2.0
+        self.baseline_calibrated, self.baseline_info = False, None
 
         print("[pomo-ai] Khởi tạo FocusDetector thành công!")
 
@@ -122,8 +114,18 @@ class FocusDetector:
 
             eye_cx = (left_eye.x + right_eye.x) / 2.0
             eye_cy = (left_eye.y + right_eye.y) / 2.0
-            look_x = round(nose.x - eye_cx, 3)
-            look_y = round(nose.y - eye_cy, 3)
+            raw_look_x = round(nose.x - eye_cx, 3)
+            raw_look_y = round(nose.y - eye_cy, 3)
+
+            # Làm mượt hướng nhìn bằng Exponential Moving Average (EMA)
+            if hasattr(self, "ema_look_x") and self.ema_look_x is not None:
+                look_x = round(0.6 * self.ema_look_x + 0.4 * raw_look_x, 3)
+                look_y = round(0.6 * self.ema_look_y + 0.4 * raw_look_y, 3)
+            else:
+                look_x = raw_look_x
+                look_y = raw_look_y
+            self.ema_look_x = look_x
+            self.ema_look_y = look_y
 
             # Lưu lại trạng thái khuôn mặt hợp lệ gần nhất
             self.last_valid_look_x = look_x
@@ -146,6 +148,8 @@ class FocusDetector:
             else:
                 self.has_face = False
                 self.eye_closed_start_time = None
+                self.ema_look_x = None
+                self.ema_look_y = None
                 raw_status = "AFK"
 
         # 3. Quét nhận diện điện thoại 2 tầng (chạy mỗi 3 khung hình để video mượt mà 30 FPS)
@@ -170,21 +174,38 @@ class FocusDetector:
 
         # 4. Phân loại trạng thái
         detail = ""
+        is_deep_flow = False
         if self.has_face:
             self.last_look_x, self.last_look_y = look_x, look_y
+
+            matched_id = self.screen_manager.match_screen(look_x, look_y, self.tolerance_x, self.tolerance_y)
+
+            # Lọc phân biệt: Chỉ tính dùng điện thoại khi gọi điện (tay gần tai) hoặc nhìn xuống hướng điện thoại
+            is_phone_distracted = has_phone and (is_suspicious_hand or matched_id is None or (look_y is not None and look_y >= 0.08))
 
             if raw_status == "SLEEPING":
                 raw_status = "DISTRACTED"
                 detail = "Nhắm mắt ngủ gật (>2.5s)"
-            elif has_phone:
+            elif is_phone_distracted:
                 raw_status = "DISTRACTED"
                 detail = "Phát hiện nghe điện thoại" if is_suspicious_hand else "Phát hiện dùng điện thoại"
             else:
-                matched_id = self.screen_manager.match_screen(look_x, look_y, self.tolerance_x, self.tolerance_y)
+                # Kiểm tra chế độ Deep Flow: Cúi đầu đọc tài liệu / ghi chép / gõ phím với mắt mở bình thường
+                is_deep_flow = (
+                    raw_status != "SLEEPING"
+                    and not is_phone_distracted
+                    and (0.10 <= (look_y or 0.0) <= 0.45)
+                    and abs((look_x or 0.0) - 0.0) <= (self.tolerance_x * 1.35)
+                )
+
                 if matched_id is not None:
                     raw_status = "FOCUSED"
                     detail = f"Màn hình {matched_id}"
                     active_screen = matched_id
+                elif is_deep_flow:
+                    raw_status = "FOCUSED"
+                    detail = "Tập trung sâu (Thao tác / Ghi chép)"
+                    active_screen = 1
                 else:
                     raw_status = "DISTRACTED"
                     detail = "Nhìn ra ngoài vùng màn hình"

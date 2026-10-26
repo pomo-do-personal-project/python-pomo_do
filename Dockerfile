@@ -9,6 +9,8 @@ ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 
 # Cài đặt các thư viện hệ thống cần thiết cho MediaPipe và OpenCV trên Linux
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libgles2 \
