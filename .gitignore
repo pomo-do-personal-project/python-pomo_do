@@ -241,3 +241,7 @@ Thumbs.db
 *.md
 !README.md
 !readme.md
+
+# User calibration config
+config.json
+*.tflite

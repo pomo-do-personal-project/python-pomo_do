@@ -86,8 +86,13 @@ async def analyze_theme_endpoint(request: Request):
             url = str(image_url).strip()
             if url.startswith("/wallpapers/") or url.startswith("wallpapers/"):
                 clean_rel = url.lstrip("/\\").replace("/", os.sep)
-                local_path = os.path.join(r"c:\Users\DELL\OneDrive\Documents\pomo-do\pomo-do-frontend\public", clean_rel)
-                if os.path.exists(local_path):
+                frontend_public = os.getenv(
+                    "FRONTEND_PUBLIC_DIR",
+                    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "pomo-do-frontend", "public"))
+                )
+                local_path = os.path.abspath(os.path.join(frontend_public, clean_rel))
+                # Ngăn chặn Directory Traversal ra ngoài thư mục static hợp lệ
+                if local_path.startswith(os.path.abspath(frontend_public)) and os.path.exists(local_path):
                     with open(local_path, "rb") as f:
                         return extract_theme_from_image_bytes(f.read())
 

@@ -3,6 +3,7 @@ vision_pipeline.py - Khởi tạo mô hình và pipeline xử lý hình ảnh ch
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -13,23 +14,37 @@ class VisionPipeline:
     """Đóng gói việc nạp và suy luận của MediaPipe và YOLO (Tối ưu RAM siêu nhẹ bằng ONNX / OpenCV DNN)."""
 
     def __init__(self, base_dir):
+        self.base_dir = base_dir
         self.use_legacy_mesh = False
         self.use_tasks_mesh = False
         self._init_mediapipe(base_dir)
-        self.yolo, self.pose = None, None
+        self.yolo = None
         self.net = None
-        self.last_wrists, self.last_hands = [], []
+        self.input_shape = (320, 416)
+        self.yolo_input_shape = self.input_shape
+        self._pool = ThreadPoolExecutor(max_workers=1)
 
-        # 1. Ưu tiên nạp mô hình ONNX qua OpenCV DNN (Tiết kiệm >300MB RAM, không cần nạp PyTorch nặng nề)
-        onnx_model_path = os.path.join(base_dir, "yolov8n.onnx")
+        # 1. Ưu tiên nạp yolov8s_fast.onnx (320x416 native 4:3, nhanh gấp 3.4 lần ~20ms/frame và độ chính xác cao hơn)
+        yolo_pref = os.getenv("YOLO_MODEL", "yolov8s_fast.onnx").strip()
+        onnx_model_path = os.path.join(base_dir, yolo_pref)
+        if not os.path.exists(onnx_model_path):
+            onnx_model_path = os.path.join(base_dir, "yolov8s.onnx")
+            self.input_shape = (640, 640)
+        elif "fast" not in os.path.basename(onnx_model_path):
+            self.input_shape = (640, 640)
+        if not os.path.exists(onnx_model_path):
+            onnx_model_path = os.path.join(base_dir, "yolov8n.onnx")
+            self.input_shape = (640, 640)
+
         if os.path.exists(onnx_model_path):
             try:
                 self.net = cv2.dnn.readNetFromONNX(onnx_model_path)
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                print("[pomo-ai] Nạp YOLOv8n ONNX (OpenCV DNN) thành công -> RAM cực nhẹ < 160MB!")
+                model_name = os.path.basename(onnx_model_path)
+                print(f"[pomo-ai] Nap {model_name} (OpenCV DNN {self.input_shape}) thanh cong -> Sieu toc & chinh xac!")
             except Exception as e:
-                print(f"[pomo-ai] Cảnh báo nạp ONNX: {e}")
+                print(f"[pomo-ai] Canh bao nap ONNX: {e}")
 
         # 2. Fallback sang PyTorch Ultralytics nếu chưa có file ONNX
         if self.net is None:
@@ -37,12 +52,28 @@ class VisionPipeline:
                 import torch
                 torch.set_num_threads(1)
                 from ultralytics import YOLO
-                self.yolo = YOLO("yolov8n.pt")
+                pt_path = os.path.join(base_dir, "yolov8s.pt")
+                if not os.path.exists(pt_path):
+                    pt_path = os.path.join(base_dir, "yolov8n.pt")
+                self.yolo = YOLO(pt_path)
             except Exception as e:
                 print(f"[pomo-ai] Cảnh báo nạp YOLO PyTorch: {e}")
 
         # Khởi tạo bộ nhận diện điện thoại
-        self.phone_detector = PhoneDetector(self.net, self.yolo)
+        self.yolo_input_shape = self.input_shape
+        self.phone_detector = PhoneDetector(self.net, self.yolo, input_shape=self.input_shape)
+
+    def analyze_frame_parallel(self, frame, run_yolo=True):
+        """Chạy song song YOLO OpenCV DNN trên luồng nền trong khi MediaPipe Face + Hand chạy trên luồng chính (~30ms toàn trình)."""
+        f_yolo = None
+        if run_yolo and self.net is not None:
+            f_yolo = self._pool.submit(self.phone_detector._get_forward_preds, frame)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        landmarks = self.extract_landmarks(frame, rgb_frame=rgb_frame)
+        hands = self.extract_hand_landmarks(frame, rgb_frame=rgb_frame)
+        if f_yolo is not None:
+            f_yolo.result()
+        return landmarks, hands
 
     def _init_mediapipe(self, current_dir):
         """Khởi tạo MediaPipe Face Mesh hỗ trợ mọi phiên bản."""
@@ -69,13 +100,49 @@ class VisionPipeline:
                 min_face_detection_confidence=0.25, min_face_presence_confidence=0.25, min_tracking_confidence=0.25
             )
             self.face_landmarker = vision.FaceLandmarker.create_from_options(opts)
+
+            # Nạp HandLandmarker nhận diện 21 điểm mốc bàn tay (chấm bi ngón tay và khớp)
+            hand_model_file = os.path.join(current_dir, "hand_landmarker.task")
+            if not os.path.exists(hand_model_file):
+                url_hand = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+                urllib.request.urlretrieve(url_hand, hand_model_file)
+
+            hand_opts = vision.HandLandmarkerOptions(
+                base_options=python.BaseOptions(model_asset_path=hand_model_file),
+                running_mode=vision.RunningMode.IMAGE, num_hands=2,
+                min_hand_detection_confidence=0.25, min_hand_presence_confidence=0.25, min_tracking_confidence=0.25
+            )
+            self.hand_landmarker = vision.HandLandmarker.create_from_options(hand_opts)
+
+            # Nạp SelfieSegmenter để làm mờ nền (Background Blur) và loại bỏ false positive vật thể nền
+            self.segmenter = None
+            segmenter_path = os.path.join(current_dir, "selfie_segmenter.tflite")
+            if not os.path.exists(segmenter_path):
+                try:
+                    url_seg = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite"
+                    urllib.request.urlretrieve(url_seg, segmenter_path)
+                except Exception as e:
+                    print(f"[pomo-ai] Không thể tải selfie_segmenter: {e}")
+
+            if os.path.exists(segmenter_path):
+                try:
+                    seg_opts = vision.ImageSegmenterOptions(
+                        base_options=python.BaseOptions(model_asset_path=segmenter_path),
+                        running_mode=vision.RunningMode.IMAGE,
+                        output_confidence_masks=True,
+                    )
+                    self.segmenter = vision.ImageSegmenter.create_from_options(seg_opts)
+                except Exception as e:
+                    print(f"[pomo-ai] Cảnh báo nạp ImageSegmenter: {e}")
+
             self.use_tasks_mesh = True
         except Exception as err:
             raise RuntimeError(f"Không thể khởi tạo MediaPipe: {err}")
 
-    def extract_landmarks(self, frame):
+    def extract_landmarks(self, frame, rgb_frame=None):
         """Trích xuất 468/478 điểm mốc khuôn mặt."""
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if rgb_frame is None:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         if self.use_legacy_mesh:
             res = self.face_mesh.process(rgb_frame)
             return res.multi_face_landmarks[0].landmark if res.multi_face_landmarks else None
@@ -85,111 +152,39 @@ class VisionPipeline:
             return res.face_landmarks[0] if (res.face_landmarks and len(res.face_landmarks) > 0) else None
         return None
 
-    def _extract_hands(self, k, w, h):
-        """Trích xuất vị trí bàn tay (trái & phải) bằng phép chiếu cánh tay."""
-        hands = []
-        if len(k) < 11:
-            return hands
-        for side, e_idx, w_idx in [("Trai", 7, 9), ("Phai", 8, 10)]:
-            elbow, wrist = k[e_idx], k[w_idx]
-            if float(wrist[2]) > 0.22:
-                wx, wy = float(wrist[0]), float(wrist[1])
-                if float(elbow[2]) > 0.22:
-                    ex, ey = float(elbow[0]), float(elbow[1])
-                    vx, vy = wx - ex, wy - ey
-                    hx, hy = int(wx + 0.35 * vx), int(wy + 0.35 * vy)
-                    r = max(35, min(int((vx**2 + vy**2)**0.5 * 0.45), 85))
-                else:
-                    hx, hy, r = int(wx), int(wy), 45
-                hands.append({
-                    "id": side,
-                    "center": [max(0, min(w, hx)), max(0, min(h, hy))],
-                    "wrist": [int(wx), int(wy)],
-                    "radius": r,
-                    "holding_phone": False
-                })
-        return hands
-
-    def estimate_pose_look(self, frame, w, h):
-        """Fallback tư thế đầu và tay bằng YOLOv8-pose khi quay mặt góc lớn."""
-        if self.pose is None:
-            return False, None, None, None, None
-
+    def extract_hand_landmarks(self, frame, rgb_frame=None):
+        """Trích xuất 21 điểm mốc (chấm bi) cho mỗi bàn tay và vùng bao quanh."""
+        if not hasattr(self, "hand_landmarker") or self.hand_landmarker is None:
+            return []
         try:
-            res = self.pose(frame, verbose=False, conf=0.25)
-            if len(res) == 0 or res[0].keypoints is None or len(res[0].keypoints.data) == 0:
-                return False, None, None, None, None
-
-            k = res[0].keypoints.data[0]
-            self.last_hands = self._extract_hands(k, w, h)
-            nose, l_eye, r_eye, l_ear, r_ear, l_sh, r_sh = k[0], k[1], k[2], k[3], k[4], k[5], k[6]
-            if nose[2] <= 0.25 and (l_sh[2] <= 0.3 or r_sh[2] <= 0.3):
-                return False, None, None, None, None
-
-            if l_sh[2] > 0.3 and r_sh[2] > 0.3:
-                sh_cx = (l_sh[0] + r_sh[0]) / 2.0
-                look_x = round(float((nose[0] - sh_cx) / max(float(abs(r_sh[0] - l_sh[0])), 60.0)), 3)
-            elif l_ear[2] > 0.25 and r_ear[2] > 0.25:
-                ear_cx = (l_ear[0] + r_ear[0]) / 2.0
-                look_x = round(float((nose[0] - ear_cx) / (max(float(abs(r_ear[0] - l_ear[0])), 30.0) * 2.0)), 3)
-            else:
-                look_x = -0.35 if l_ear[2] > 0.25 else 0.35 if r_ear[2] > 0.25 else (-0.25 if nose[0] < (w / 2) else 0.25)
-
-            points = {
-                "nose": (int(nose[0]), int(nose[1])),
-                "left_eye": (int(l_eye[0]), int(l_eye[1])) if l_eye[2] > 0.2 else (int(l_ear[0]), int(l_ear[1])),
-                "right_eye": (int(r_eye[0]), int(r_eye[1])) if r_eye[2] > 0.2 else (int(r_ear[0]), int(r_ear[1]))
-            }
-            head_pts = [p for p in [nose, l_eye, r_eye, l_ear, r_ear] if p[2] > 0.2]
-            face_box = None
-            if head_pts:
-                kx, ky = [int(p[0]) for p in head_pts], [int(p[1]) for p in head_pts]
-                face_box = [max(0, min(kx) - 25), max(0, min(ky) - 35), min(w, max(kx) + 25), min(h, max(ky) + 35)]
-
-            return True, look_x, 0.09, points, face_box
+            if rgb_frame is None:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            res = self.hand_landmarker.detect(mp_img)
+            h, w = frame.shape[:2]
+            hands_data = []
+            if res.hand_landmarks:
+                for hand_lms in res.hand_landmarks:
+                    pts = [(int(p.x * w), int(p.y * h)) for p in hand_lms]
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    cx = int(sum(xs) / len(xs))
+                    cy = int(sum(ys) / len(ys))
+                    radius = int(max(max(xs) - min(xs), max(ys) - min(ys)) / 2.0)
+                    hands_data.append({
+                        "points": pts,
+                        "box": [max(0, min(xs)), max(0, min(ys)), min(w, max(xs)), min(h, max(ys))],
+                        "center": (cx, cy),
+                        "radius": radius,
+                        "holding_phone": False
+                    })
+            return hands_data
         except Exception as e:
-            print(f"[pomo-ai] Cảnh báo YOLO Pose: {e}")
-            return False, None, None, None, None
+            print(f"[pomo-ai] Cảnh báo nhận diện bàn tay: {e}")
+            return []
 
-    def check_suspicious_hand_near_ear(self, frame, face_box):
-        """Kiểm tra tay gần tai và cập nhật danh sách bàn tay (hands)."""
-        if self.pose is None:
-            return False, None
 
-        h, w = frame.shape[:2]
-        try:
-            res = self.pose(frame, verbose=False, conf=0.25, imgsz=320)
-            if len(res) == 0 or res[0].keypoints is None or len(res[0].keypoints.data) == 0:
-                self.last_wrists, self.last_hands = [], []
-                return False, None
-
-            k = res[0].keypoints.data[0]
-            self.last_hands = self._extract_hands(k, w, h)
-            if face_box is None:
-                return False, None
-
-            fx1, fy1, fx2, fy2 = face_box
-            fw, fh = fx2 - fx1, fy2 - fy1
-            fcx = (fx1 + fx2) / 2.0
-            l_ear, r_ear = k[3], k[4]
-            self.last_wrists = [k[9], k[10]] if len(k) > 10 else []
-
-            for wrist in self.last_wrists:
-                wx, wy, w_conf = float(wrist[0]), float(wrist[1]), float(wrist[2])
-                if w_conf < 0.25:
-                    continue
-                is_height = (fy1 - fh * 0.25) <= wy <= (fy2 + fh * 0.35)
-                dist_l = ((wx - float(l_ear[0]))**2 + (wy - float(l_ear[1]))**2)**0.5 if l_ear[2] > 0.25 else 9999
-                dist_r = ((wx - float(r_ear[0]))**2 + (wy - float(r_ear[1]))**2)**0.5 if r_ear[2] > 0.25 else 9999
-                if (is_height and abs(wx - fcx) <= (fw * 1.3)) or min(dist_l, dist_r) < (fw * 1.1):
-                    pad = int(fw * 0.8)
-                    return True, [max(0, int(wx - pad)), max(0, int(wy - pad)), min(w, int(wx + pad)), min(h, int(wy + pad))]
-        except Exception as e:
-            print(f"[pomo-ai] Cảnh báo kiểm tra tay gần tai: {e}")
-
-        return False, None
-
-    def detect_person_and_head(self, frame, conf_threshold=0.40, imgsz=256):
+    def detect_person_and_head(self, frame, conf_threshold=0.25, imgsz=640):
         """Phát hiện người và ước lượng vị trí đầu khi MediaPipe bị che khuất tạm thời (chạm tay, quay đầu)."""
         if self.net is None and self.yolo is None:
             return False, None
@@ -197,35 +192,76 @@ class VisionPipeline:
         h, w = frame.shape[:2]
         try:
             if self.net is not None:
-                blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
-                self.net.setInput(blob)
-                preds = self.net.forward()
-                preds = preds[0].transpose(1, 0)
+                preds, (r, dw, dh) = self.phone_detector._get_forward_preds(frame, imgsz=imgsz)
+                if preds is None:
+                    return False, None
                 person_scores = preds[:, 4]  # Class 0: person
                 best_idx = int(np.argmax(person_scores))
                 if person_scores[best_idx] > conf_threshold:
                     p = preds[best_idx]
-                    scale_x = w / float(imgsz)
-                    scale_y = h / float(imgsz)
-                    cx, cy, bw, bh = p[0] * scale_x, p[1] * scale_y, p[2] * scale_x, p[3] * scale_y
-                    px1 = max(0, int(cx - bw / 2.0))
+                    cx = (p[0] - dw) / r
+                    cy = (p[1] - dh) / r
+                    bw = p[2] / r
+                    bh = p[3] / r
                     py1 = max(0, int(cy - bh / 2.0))
-                    px2 = min(w, int(cx + bw / 2.0))
-                    head_bottom = min(h, int(py1 + bh * 0.45))
-                    return True, [px1, py1, px2, head_bottom]
+                    head_w = int(bw * 0.40)
+                    hx1 = max(0, int(cx - head_w / 2.0))
+                    hx2 = min(w, int(cx + head_w / 2.0))
+                    head_bottom = min(h, int(py1 + bh * 0.65))
+                    return True, [hx1, py1, hx2, head_bottom]
             elif self.yolo is not None:
-                res = self.yolo(frame, verbose=False, conf=conf_threshold, classes=[0], imgsz=256)
+                res = self.yolo(frame, verbose=False, conf=conf_threshold, classes=[0], imgsz=640)
                 for r in res:
                     for box in r.boxes:
                         b = [int(v) for v in box.xyxy[0].tolist()]
+                        bw = b[2] - b[0]
                         bh = b[3] - b[1]
-                        return True, [b[0], b[1], b[2], min(h, int(b[1] + bh * 0.45))]
+                        cx = (b[0] + b[2]) / 2.0
+                        head_w = int(bw * 0.40)
+                        hx1 = max(0, int(cx - head_w / 2.0))
+                        hx2 = min(w, int(cx + head_w / 2.0))
+                        return True, [hx1, b[1], hx2, min(h, int(b[1] + bh * 0.65))]
         except Exception as e:
             print(f"[pomo-ai] Cảnh báo phát hiện người: {e}")
 
         return False, None
 
-    def detect_phone(self, frame, face_box, look_x, suspicious_roi=None):
-        """Nhận diện điện thoại qua PhoneDetector kết hợp HOI."""
-        return self.phone_detector.detect_phone(frame, face_box, look_x, suspicious_roi, self.last_hands)
+    def get_person_mask(self, frame, rgb_frame=None):
+        """Trích xuất mặt nạ người (Foreground mask: 0.0 đến 1.0) qua MediaPipe ImageSegmenter."""
+        if getattr(self, "segmenter", None) is None:
+            return None
+        try:
+            if rgb_frame is None:
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            res = self.segmenter.segment(mp_img)
+            if res and res.confidence_masks:
+                mask = res.confidence_masks[0].numpy_view()
+                if len(mask.shape) == 3 and mask.shape[2] == 1:
+                    mask = mask[:, :, 0]
+                return mask.astype(np.float32)
+        except Exception:
+            pass
+        return None
+
+    def apply_background_blur(self, frame, ksize=35, rgb_frame=None):
+        """Làm mờ toàn bộ hậu cảnh (Background Blur) và giữ sắc nét người dùng."""
+        mask = self.get_person_mask(frame, rgb_frame=rgb_frame)
+        if mask is None:
+            return frame, None
+
+        if ksize % 2 == 0:
+            ksize += 1
+
+        blurred_bg = cv2.GaussianBlur(frame, (ksize, ksize), 0)
+        # Làm mịn viền alpha để tạo hiệu ứng bokeh tự nhiên, không bị viền nham nhở
+        mask_soft = cv2.GaussianBlur(mask, (7, 7), 0)
+        mask_3d = mask_soft[:, :, np.newaxis]
+
+        composed = (frame * mask_3d + blurred_bg * (1.0 - mask_3d)).astype(np.uint8)
+        return composed, mask
+
+    def detect_phone(self, frame, face_box, look_x=None, hands=None, person_mask=None, look_y=None):
+        """Nhận diện điện thoại qua PhoneDetector kết hợp bàn tay và mặt nạ người."""
+        return self.phone_detector.detect_phone(frame, face_box, look_x, hands, person_mask=person_mask, look_y=look_y)
 

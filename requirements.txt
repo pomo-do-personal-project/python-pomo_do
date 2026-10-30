@@ -1,7 +1,8 @@
-opencv-python>=4.8.0
-mediapipe>=0.10.0
-ultralytics>=8.0.0
-fastapi>=0.100.0
-uvicorn>=0.23.0
-websockets>=11.0.0
-psutil>=5.9.0
+# Pinned dependencies for reproducible and secure container builds
+opencv-python==4.10.0.84
+mediapipe==0.10.14
+ultralytics==8.3.40
+fastapi==0.115.6
+uvicorn==0.32.1
+websockets==13.1
+psutil==6.1.0

@@ -24,11 +24,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy toàn bộ mã nguồn và models (.task, .pt)
+# Copy toàn bộ mã nguồn và models (.task, .onnx, .pt)
 COPY . .
+
+# Tạo người dùng non-root và phân quyền thư mục làm việc để tăng cường an ninh container
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
 
 # Render tự động cấp biến $PORT, uvicorn sẽ lắng nghe cổng này
 ENV PORT=8001
 EXPOSE 8001
+
+# Healthcheck định kỳ kiểm tra trạng thái phản hồi của service AI
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python3 -c "import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT', '8001') + '/').read()" || exit 1
 
 CMD ["sh", "-c", "uvicorn server:app --host 0.0.0.0 --port ${PORT:-8001}"]

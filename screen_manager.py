@@ -18,15 +18,16 @@ if hasattr(sys.stdout, "reconfigure"):
 class ScreenManager:
     """Quản lý lưu trữ và đối chiếu các màn hình hiệu chuẩn."""
 
-    def __init__(self, config_filename="config.json"):
+    def __init__(self, config_filename=None):
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        self.config_path = os.path.join(current_dir, config_filename)
+        self.config_path = os.path.join(current_dir, config_filename) if config_filename else None
         self.screens = []
-        self.load_screens()
+        if self.config_path:
+            self.load_screens()
 
     def load_screens(self):
-        """Đọc danh sách màn hình từ config.json."""
-        if os.path.exists(self.config_path):
+        """Đọc danh sách màn hình từ config.json nếu có."""
+        if self.config_path and os.path.exists(self.config_path):
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     self.screens = json.load(f)
@@ -38,7 +39,9 @@ class ScreenManager:
             self.screens = []
 
     def save_screens(self):
-        """Lưu danh sách màn hình vào config.json."""
+        """Lưu danh sách màn hình vào config.json nếu có đường dẫn file."""
+        if not self.config_path:
+            return True
         try:
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.screens, f, indent=2, ensure_ascii=False)
